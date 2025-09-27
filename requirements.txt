@@ -1,0 +1,8 @@
+ultralytics>=8.0.0
+opencv-python>=4.5
+numpy
+pandas
+scipy
+# Optional: filterpy (for Kalman-filter based trackers). If you need it, install manually
+# after upgrading pip or using PEP517 build flags to avoid deprecation warnings.
+# filterpy
