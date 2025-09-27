@@ -24,7 +24,10 @@ Files
 - `src/tracker.py`: simple centroid tracker and util functions
 - `requirements.txt`: Python dependencies
 
-
+Notes & next steps
+- To improve accuracy, fine-tune a YOLO model on your dataset
+- Replace centroid tracker with DeepSORT for robust ID assignment
+- Add speed estimation and traffic classification
 
 Dependency notes
 - If you see a pip deprecation or build warning for packages like `filterpy`, it's safe to skip them unless you need Kalman-based trackers. Prefer upgrading pip inside your virtualenv first (see Quickstart). If you do need `filterpy`, install it after upgrading pip or by using pip's PEP 517 build options:
