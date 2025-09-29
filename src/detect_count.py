@@ -8,9 +8,34 @@ import numpy as np
 from ultralytics import YOLO
 
 from tracker import CentroidTracker
+from plate_detector import detect_plates, has_pytesseract
 
 # classes of interest (COCO labels)
 VEHICLE_CLASSES = {2: 'car', 3: 'motorcycle', 5: 'bus', 7: 'truck'}
+
+
+def draw_label(img, bbox, text, color=(0, 255, 0), font_scale=0.6, thickness=2):
+    """Draw a rectangle with a filled label above it.
+    bbox: (x1,y1,x2,y2)
+    text: label text
+    """
+    x1, y1, x2, y2 = bbox
+    # box
+    cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
+
+    # label background
+    (w, h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+    pad = 4
+    lx1 = x1
+    ly1 = max(0, y1 - h - pad * 2)
+    lx2 = x1 + w + pad * 2
+    ly2 = y1
+    cv2.rectangle(img, (lx1, ly1), (lx2, ly2), color, -1)
+
+    # label text (white on colored background)
+    text_x = x1 + pad
+    text_y = y1 - pad
+    cv2.putText(img, text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness)
 
 
 def parse_args():
@@ -21,6 +46,8 @@ def parse_args():
     parser.add_argument('--model', type=str, default='yolov8n.pt', help='Ultralytics model')
     parser.add_argument('--conf', type=float, default=0.3, help='Confidence threshold')
     parser.add_argument('--iou', type=float, default=0.5, help='NMS IoU threshold')
+    parser.add_argument('--plates', action='store_true', help='Enable license plate detection for vehicle ROIs')
+    parser.add_argument('--ocr', action='store_true', help='Run OCR on detected plates (requires pytesseract and tesseract binary)')
     return parser.parse_args()
 
 
@@ -153,9 +180,11 @@ def main():
                 if len(object_tracks[oid]) > 10:
                     object_tracks[oid] = object_tracks[oid][-10:]
 
-                # draw bbox and id
-                cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0,255,0), 2)
-                cv2.putText(frame, f"ID {oid} {cls_name}", (bbox[0], bbox[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0),2)
+                # draw bbox and label with confidence and id
+                conf_pct = int(info.get('score', 0) * 100)
+                label = f"{cls_name}: {conf_pct}%"
+                draw_label(frame, bbox, label, color=(0,255,0), font_scale=0.5, thickness=1)
+                cv2.putText(frame, f"ID {oid}", (bbox[0], bbox[3]+15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0),1)
                 cv2.circle(frame, (cx, cy), 3, (0,0,255), -1)
 
                 # check crossing event
@@ -175,6 +204,30 @@ def main():
                         ts = frame_idx / fps
                         csv_writer.writerow([f"{ts:.2f}", frame_idx, oid, cls_name, 'out'])
 
+                # optional: detect license plates inside vehicle bbox
+                if args.plates:
+                    # expand bbox slightly to include plate area
+                    x1b, y1b, x2b, y2b = bbox
+                    pad_w = int((x2b - x1b) * 0.05)
+                    pad_h = int((y2b - y1b) * 0.1)
+                    rx1 = max(0, x1b - pad_w)
+                    ry1 = max(0, y1b - pad_h)
+                    rx2 = min(width - 1, x2b + pad_w)
+                    ry2 = min(height - 1, y2b + pad_h)
+                    roi = frame[ry1:ry2, rx1:rx2]
+                    plate_results = detect_plates(roi, ocr=(args.ocr and has_pytesseract()))
+                    for pr in plate_results:
+                        pbx1, pby1, pbx2, pby2 = pr['bbox']
+                        # bbox coordinates are relative to roi; convert to frame coords
+                        pbx1_f = rx1 + pbx1
+                        pby1_f = ry1 + pby1
+                        pbx2_f = rx1 + pbx2
+                        pby2_f = ry1 + pby2
+                        # draw plate box
+                        cv2.rectangle(frame, (pbx1_f, pby1_f), (pbx2_f, pby2_f), (0, 255, 255), 2)
+                        if pr.get('text'):
+                            cv2.putText(frame, pr['text'], (pbx1_f, pby1_f - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255),2)
+
             # overlay counts
             cv2.putText(frame, f"IN: {counts['in']}", (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,255,0),2)
             cv2.putText(frame, f"OUT: {counts['out']}", (10,70), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,255,0),2)
@@ -182,8 +235,11 @@ def main():
             # write frame
             writer.write(frame)
 
-            # optional: show
-            cv2.imshow('frame', frame)
+            # optional: show in fullscreen
+            cv2.namedWindow("frame", cv2.WND_PROP_FULLSCREEN)
+            cv2.setWindowProperty("frame", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+            cv2.imshow("frame", frame)
+
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 

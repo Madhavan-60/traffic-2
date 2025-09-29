@@ -24,6 +24,19 @@ Files
 - `src/tracker.py`: simple centroid tracker and util functions
 - `requirements.txt`: Python dependencies
 
+OCR / Number-plate notes
+- The project includes an optional license-plate detection + OCR feature. To enable OCR you need:
+  - The Tesseract binary installed on your system (https://github.com/tesseract-ocr/tesseract). On Windows, install the Tesseract executable and add it to your PATH or set pytesseract.pytesseract.tesseract_cmd accordingly.
+  - The Python package `pytesseract` (added to `requirements.txt`).
+
+Usage example (detect plates without OCR):
+
+   python src/detect_count.py --source path/to/video.mp4 --output output.mp4 --plates
+
+To enable OCR (if pytesseract and Tesseract are available):
+
+   python src/detect_count.py --source path/to/video.mp4 --output output.mp4 --plates --ocr
+
 Notes & next steps
 - To improve accuracy, fine-tune a YOLO model on your dataset
 - Replace centroid tracker with DeepSORT for robust ID assignment
