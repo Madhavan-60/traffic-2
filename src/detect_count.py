@@ -253,3 +253,152 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+def process_video(
+    source_path: str,
+    output_path: str = 'output.mp4',
+    counting_line: tuple | None = None,
+    model_path: str = 'yolov8n.pt',
+    conf: float = 0.3,
+    iou: float = 0.5,
+    detect_plates_in_rois: bool = False,
+    run_ocr: bool = False,
+):
+    """Process a video file, overlay detections and counts, and write output video.
+
+    Returns a dict with keys: {'output_path': str, 'counts': {'in': int, 'out': int}}
+    """
+    p = Path(source_path)
+    if not p.exists():
+        return {'error': f'Video file not found: {source_path}'}
+
+    cap = cv2.VideoCapture(str(p))
+    if not cap.isOpened():
+        return {'error': f'Error opening video source {source_path}'}
+
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+        model = YOLO(model_path)
+        tracker = CentroidTracker(max_disappeared=40, max_distance=60)
+        counts = {'in': 0, 'out': 0}
+
+        if counting_line:
+            x1, y1, x2, y2 = counting_line
+        else:
+            x1, y1, x2, y2 = 0, int(height * 0.6), width, int(height * 0.6)
+
+        object_tracks = {}
+        counted_ids = set()
+
+        frame_idx = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame_idx += 1
+
+            results = model.predict(frame, conf=conf, iou=iou, verbose=False)
+            r = results[0]
+            boxes = r.boxes
+
+            rects = []
+            classes = []
+            scores = []
+            for box in boxes:
+                cls = int(box.cls[0])
+                if cls not in VEHICLE_CLASSES:
+                    continue
+                score = float(box.conf[0])
+                x1b, y1b, x2b, y2b = map(int, box.xyxy[0])
+                rects.append((x1b, y1b, x2b, y2b))
+                classes.append(VEHICLE_CLASSES[cls])
+                scores.append(score)
+
+            objects = tracker.update(rects)
+
+            centroid_to_info = {}
+            for oid, centroid in objects.items():
+                if len(rects) == 0:
+                    continue
+                dists = [np.linalg.norm(np.array(centroid) - np.array(((r[0] + r[2]) // 2, (r[1] + r[3]) // 2))) for r in rects]
+                idx = int(np.argmin(dists))
+                centroid_to_info[oid] = {
+                    'centroid': centroid,
+                    'bbox': rects[idx],
+                    'class': classes[idx],
+                    'score': scores[idx]
+                }
+
+            cv2.line(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+            line_y = (y1 + y2) // 2
+
+            for oid, info in centroid_to_info.items():
+                c = info['centroid']
+                bbox = info['bbox']
+                cls_name = info['class']
+                cx, cy = int(c[0]), int(c[1])
+
+                if oid not in object_tracks:
+                    object_tracks[oid] = []
+                object_tracks[oid].append(cy)
+                if len(object_tracks[oid]) > 10:
+                    object_tracks[oid] = object_tracks[oid][-10:]
+
+                conf_pct = int(info.get('score', 0) * 100)
+                label = f"{cls_name}: {conf_pct}%"
+                draw_label(frame, bbox, label, color=(0, 255, 0), font_scale=0.5, thickness=1)
+                cv2.putText(frame, f"ID {oid}", (bbox[0], bbox[3] + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                cv2.circle(frame, (cx, cy), 3, (0, 0, 255), -1)
+
+                if oid not in counted_ids and len(object_tracks[oid]) >= 2:
+                    prev_y = object_tracks[oid][-2]
+                    cur_y = object_tracks[oid][-1]
+                    if prev_y < line_y and cur_y >= line_y:
+                        counts['in'] += 1
+                        counted_ids.add(oid)
+                    elif prev_y > line_y and cur_y <= line_y:
+                        counts['out'] += 1
+                        counted_ids.add(oid)
+
+                if detect_plates_in_rois:
+                    x1b, y1b, x2b, y2b = bbox
+                    pad_w = int((x2b - x1b) * 0.05)
+                    pad_h = int((y2b - y1b) * 0.1)
+                    rx1 = max(0, x1b - pad_w)
+                    ry1 = max(0, y1b - pad_h)
+                    rx2 = min(width - 1, x2b + pad_w)
+                    ry2 = min(height - 1, y2b + pad_h)
+                    roi = frame[ry1:ry2, rx1:rx2]
+                    plate_results = detect_plates(roi, ocr=(run_ocr and has_pytesseract()))
+                    for pr in plate_results:
+                        pbx1, pby1, pbx2, pby2 = pr['bbox']
+                        pbx1_f = rx1 + pbx1
+                        pby1_f = ry1 + pby1
+                        pbx2_f = rx1 + pbx2
+                        pby2_f = ry1 + pby2
+                        cv2.rectangle(frame, (pbx1_f, pby1_f), (pbx2_f, pby2_f), (0, 255, 255), 2)
+                        if pr.get('text'):
+                            cv2.putText(frame, pr['text'], (pbx1_f, pby1_f - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+            cv2.putText(frame, f"IN: {counts['in']}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+            cv2.putText(frame, f"OUT: {counts['out']}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+
+            writer.write(frame)
+
+        return {'output_path': output_path, 'counts': counts}
+    finally:
+        try:
+            cap.release()
+        except Exception:
+            pass
+        try:
+            writer.release()
+        except Exception:
+            pass

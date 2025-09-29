@@ -1,18 +1,39 @@
-from flask import Flask, request, render_template_string
+from flask import Flask, request, render_template_string, Response, redirect, url_for
 import cv2
 import numpy as np
+import os
+import sys
+import uuid
+
+# Ensure we can import modules from the local src directory when running app.py directly
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+SRC_DIR = os.path.join(CURRENT_DIR, 'src')
+if SRC_DIR not in sys.path:
+    sys.path.insert(0, SRC_DIR)
+
 from plate_detector import detect_plates
+from detect_count import process_video, draw_label, VEHICLE_CLASSES
+from tracker import CentroidTracker
+from ultralytics import YOLO
 
 app = Flask(__name__)
+
+# Load YOLO model once for image annotations
+YOLO_MODEL = YOLO(os.path.join(CURRENT_DIR, 'yolov8n.pt')) if os.path.exists(os.path.join(CURRENT_DIR, 'yolov8n.pt')) else YOLO('yolov8n.pt')
+
+# Track uploaded video sources by id for streaming
+VIDEO_SOURCES = {}
 
 HTML = '''
 <!doctype html>
 <title>Plate Detection</title>
-<h2>Upload an image for plate detection</h2>
+<h2>Upload an image or video</h2>
 <form method=post enctype=multipart/form-data>
-  <input type=file name=file>
+  <input type=file name=file accept="image/*,video/*">
+  <label><input type=checkbox name=video value=1> Treat as video</label>
   <input type=submit value=Upload>
 </form>
+<p><a href="/live">Go to Live Detection</a></p>
 {% if results %}
   <h3>Detected Plates:</h3>
   <ul>
@@ -21,19 +42,345 @@ HTML = '''
   {% endfor %}
   </ul>
 {% endif %}
+{% if image_url %}
+  <h3>Processed Image:</h3>
+  <img src="{{ image_url }}" style="max-width: 640px; height: auto;" />
+{% endif %}
+{% if video_url %}
+  <h3>Processed Video:</h3>
+  <video width="640" controls>
+    <source src="{{ video_url }}" type="video/mp4">
+  </video>
+  {% if counts %}
+    <h3>Vehicle Counts:</h3>
+    <p>IN: {{ counts['in'] }} | OUT: {{ counts['out'] }}</p>
+  {% endif %}
+{% endif %}
 '''
 
 @app.route('/', methods=['GET', 'POST'])
 def upload_file():
     results = None
+    video_url = None
+    image_url = None
+    counts = None
     if request.method == 'POST':
-        file = request.files['file']
-        if file:
-            # Read image from upload
-            img_bytes = np.frombuffer(file.read(), np.uint8)
-            img = cv2.imdecode(img_bytes, cv2.IMREAD_COLOR)
-            results = detect_plates(img, ocr=False)
-    return render_template_string(HTML, results=results)
+        file = request.files.get('file')
+        if file and file.filename:
+            filename = file.filename.lower()
+            is_video = ('video' in request.form) or any(filename.endswith(ext) for ext in ['.mp4', '.mov', '.avi', '.mkv'])
+
+            if is_video:
+                tmp_in = os.path.join(CURRENT_DIR, 'upload_video_tmp')
+                os.makedirs(tmp_in, exist_ok=True)
+                in_path = os.path.join(tmp_in, 'input_' + filename.replace(' ', '_'))
+                file.save(in_path)
+
+                vid = uuid.uuid4().hex
+                VIDEO_SOURCES[vid] = in_path
+                return redirect(url_for('watch_video', vid=vid))
+            else:
+                # Read uploaded bytes and decode as image
+                file_bytes = file.read()
+                img_bytes = np.frombuffer(file_bytes, np.uint8)
+                img = cv2.imdecode(img_bytes, cv2.IMREAD_COLOR)
+                if img is None:
+                    results = [{'bbox': (0, 0, 0, 0), 'text': 'Failed to decode image. Please upload a valid image file.'}]
+                else:
+                    # 1) Vehicle detection using YOLO
+                    try:
+                        yolo_results = YOLO_MODEL.predict(img, conf=0.3, iou=0.5, verbose=False)
+                        r = yolo_results[0]
+                        boxes = r.boxes
+                        for box in boxes:
+                            cls = int(box.cls[0])
+                            if cls not in VEHICLE_CLASSES:
+                                continue
+                            score = float(box.conf[0])
+                            x1b, y1b, x2b, y2b = map(int, box.xyxy[0])
+                            label = f"{VEHICLE_CLASSES[cls]}: {int(score*100)}%"
+                            draw_label(img, (x1b, y1b, x2b, y2b), label, color=(0, 255, 0), font_scale=0.6, thickness=2)
+                    except Exception:
+                        pass
+
+                    # 2) Optional: license plate candidates (non-OCR) over whole image
+                    plate_results = detect_plates(img, ocr=False)
+                    if plate_results:
+                        if results is None:
+                            results = []
+                        results.extend(plate_results)
+                        for pr in plate_results:
+                            x1, y1, x2, y2 = pr['bbox']
+                            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 255), 2)
+                            if pr.get('text'):
+                                cv2.putText(img, pr['text'], (x1, max(0, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                    out_img_path = os.path.join(CURRENT_DIR, 'output.jpg')
+                    ok = cv2.imwrite(out_img_path, img)
+                    if ok:
+                        image_url = '/image/output'
+                    else:
+                        results = [{'bbox': (0, 0, 0, 0), 'text': 'Failed to save processed image.'}]
+    return render_template_string(HTML, results=results, video_url=video_url, image_url=image_url, counts=counts)
+
+
+@app.route('/video/output')
+def serve_output_video():
+    # Serve the most recent processed video
+    from flask import send_file
+    out_path = os.path.join(CURRENT_DIR, 'output.mp4')
+    if not os.path.exists(out_path):
+        return 'No processed video found', 404
+    return send_file(out_path, mimetype='video/mp4', as_attachment=False)
+
+
+@app.route('/image/output')
+def serve_output_image():
+    from flask import send_file
+    out_img_path = os.path.join(CURRENT_DIR, 'output.jpg')
+    if not os.path.exists(out_img_path):
+        return 'No processed image found', 404
+    return send_file(out_img_path, mimetype='image/jpeg', as_attachment=False)
+
+
+def gen_live(camera_index: int = 0):
+    cap = cv2.VideoCapture(camera_index)
+    if not cap.isOpened():
+        raise RuntimeError('Cannot open webcam')
+    tracker = CentroidTracker(max_disappeared=40, max_distance=60)
+    counts = {'in': 0, 'out': 0}
+    object_tracks = {}
+    counted_ids = set()
+    line_initialized = False
+    x1 = y1 = x2 = y2 = 0
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            try:
+                h, w = frame.shape[:2]
+                if not line_initialized:
+                    x1, y1, x2, y2 = 0, int(h * 0.6), w, int(h * 0.6)
+                    line_initialized = True
+
+                yolo_results = YOLO_MODEL.predict(frame, conf=0.3, iou=0.5, verbose=False)
+                r = yolo_results[0]
+                boxes = r.boxes
+                rects = []
+                classes = []
+                scores = []
+                for box in boxes:
+                    cls = int(box.cls[0])
+                    if cls not in VEHICLE_CLASSES:
+                        continue
+                    score = float(box.conf[0])
+                    x1b, y1b, x2b, y2b = map(int, box.xyxy[0])
+                    rects.append((x1b, y1b, x2b, y2b))
+                    classes.append(VEHICLE_CLASSES[cls])
+                    scores.append(score)
+
+                objects = tracker.update(rects)
+
+                # draw counting line
+                cv2.line(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                line_y = (y1 + y2) // 2
+
+                # map object ids to nearest rect/class
+                centroid_to_info = {}
+                for oid, centroid in objects.items():
+                    if len(rects) == 0:
+                        continue
+                    dists = [np.linalg.norm(np.array(centroid) - np.array(((rct[0]+rct[2])//2, (rct[1]+rct[3])//2))) for rct in rects]
+                    idx = int(np.argmin(dists))
+                    centroid_to_info[oid] = {
+                        'centroid': centroid,
+                        'bbox': rects[idx],
+                        'class': classes[idx] if idx < len(classes) else 'vehicle',
+                        'score': scores[idx] if idx < len(scores) else 0.0
+                    }
+
+                for oid, info in centroid_to_info.items():
+                    c = info['centroid']
+                    bbox = info['bbox']
+                    cls_name = info['class']
+                    cx, cy = int(c[0]), int(c[1])
+
+                    # track history
+                    if oid not in object_tracks:
+                        object_tracks[oid] = []
+                    object_tracks[oid].append(cy)
+                    if len(object_tracks[oid]) > 10:
+                        object_tracks[oid] = object_tracks[oid][-10:]
+
+                    conf_pct = int(info.get('score', 0) * 100)
+                    label = f"{cls_name}: {conf_pct}%"
+                    draw_label(frame, bbox, label, color=(0, 255, 0), font_scale=0.5, thickness=1)
+                    cv2.putText(frame, f"ID {oid}", (bbox[0], bbox[3] + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                    cv2.circle(frame, (cx, cy), 3, (0, 0, 255), -1)
+
+                    # crossing check
+                    if oid not in counted_ids and len(object_tracks[oid]) >= 2:
+                        prev_y = object_tracks[oid][-2]
+                        cur_y = object_tracks[oid][-1]
+                        if prev_y < line_y and cur_y >= line_y:
+                            counts['in'] += 1
+                            counted_ids.add(oid)
+                        elif prev_y > line_y and cur_y <= line_y:
+                            counts['out'] += 1
+                            counted_ids.add(oid)
+
+                # overlay totals
+                cv2.putText(frame, f"IN: {counts['in']}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+                cv2.putText(frame, f"OUT: {counts['out']}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+            except Exception:
+                pass
+
+            ret, buffer = cv2.imencode('.jpg', frame)
+            if not ret:
+                continue
+            frame_bytes = buffer.tobytes()
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+    finally:
+        cap.release()
+
+
+@app.route('/live_feed')
+def live_feed():
+    return Response(gen_live(0), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
+@app.route('/live')
+def live_page():
+    live_html = '''
+    <!doctype html>
+    <title>Live Detection</title>
+    <h2>Live Webcam Detection</h2>
+    <p><a href="/">Back to Home</a></p>
+    <img src="/live_feed" style="max-width: 800px; height: auto;" />
+    '''
+    return render_template_string(live_html)
+
+
+def gen_video_stream(video_path: str):
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f'Cannot open video: {video_path}')
+    tracker = CentroidTracker(max_disappeared=40, max_distance=60)
+    counts = {'in': 0, 'out': 0}
+    object_tracks = {}
+    counted_ids = set()
+    line_initialized = False
+    x1 = y1 = x2 = y2 = 0
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            try:
+                h, w = frame.shape[:2]
+                if not line_initialized:
+                    x1, y1, x2, y2 = 0, int(h * 0.6), w, int(h * 0.6)
+                    line_initialized = True
+
+                yolo_results = YOLO_MODEL.predict(frame, conf=0.3, iou=0.5, verbose=False)
+                r = yolo_results[0]
+                boxes = r.boxes
+                rects = []
+                classes = []
+                scores = []
+                for box in boxes:
+                    cls = int(box.cls[0])
+                    if cls not in VEHICLE_CLASSES:
+                        continue
+                    score = float(box.conf[0])
+                    x1b, y1b, x2b, y2b = map(int, box.xyxy[0])
+                    rects.append((x1b, y1b, x2b, y2b))
+                    classes.append(VEHICLE_CLASSES[cls])
+                    scores.append(score)
+
+                objects = tracker.update(rects)
+
+                # draw counting line
+                cv2.line(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                line_y = (y1 + y2) // 2
+
+                centroid_to_info = {}
+                for oid, centroid in objects.items():
+                    if len(rects) == 0:
+                        continue
+                    dists = [np.linalg.norm(np.array(centroid) - np.array(((rct[0]+rct[2])//2, (rct[1]+rct[3])//2))) for rct in rects]
+                    idx = int(np.argmin(dists))
+                    centroid_to_info[oid] = {
+                        'centroid': centroid,
+                        'bbox': rects[idx],
+                        'class': classes[idx] if idx < len(classes) else 'vehicle',
+                        'score': scores[idx] if idx < len(scores) else 0.0
+                    }
+
+                for oid, info in centroid_to_info.items():
+                    c = info['centroid']
+                    bbox = info['bbox']
+                    cls_name = info['class']
+                    cx, cy = int(c[0]), int(c[1])
+
+                    if oid not in object_tracks:
+                        object_tracks[oid] = []
+                    object_tracks[oid].append(cy)
+                    if len(object_tracks[oid]) > 10:
+                        object_tracks[oid] = object_tracks[oid][-10:]
+
+                    conf_pct = int(info.get('score', 0) * 100)
+                    label = f"{cls_name}: {conf_pct}%"
+                    draw_label(frame, bbox, label, color=(0, 255, 0), font_scale=0.5, thickness=1)
+                    cv2.putText(frame, f"ID {oid}", (bbox[0], bbox[3] + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                    cv2.circle(frame, (cx, cy), 3, (0, 0, 255), -1)
+
+                    if oid not in counted_ids and len(object_tracks[oid]) >= 2:
+                        prev_y = object_tracks[oid][-2]
+                        cur_y = object_tracks[oid][-1]
+                        if prev_y < line_y and cur_y >= line_y:
+                            counts['in'] += 1
+                            counted_ids.add(oid)
+                        elif prev_y > line_y and cur_y <= line_y:
+                            counts['out'] += 1
+                            counted_ids.add(oid)
+
+                cv2.putText(frame, f"IN: {counts['in']}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+                cv2.putText(frame, f"OUT: {counts['out']}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+            except Exception:
+                pass
+
+            ret, buffer = cv2.imencode('.jpg', frame)
+            if not ret:
+                continue
+            frame_bytes = buffer.tobytes()
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+    finally:
+        cap.release()
+
+
+@app.route('/stream_feed/<vid>')
+def stream_feed(vid):
+    video_path = VIDEO_SOURCES.get(vid)
+    if not video_path or not os.path.exists(video_path):
+        return 'Video not found', 404
+    return Response(gen_video_stream(video_path), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
+@app.route('/watch/<vid>')
+def watch_video(vid):
+    if vid not in VIDEO_SOURCES:
+        return 'Video not found', 404
+    page = '''
+    <!doctype html>
+    <title>Video Detection</title>
+    <h2>Streaming processed video</h2>
+    <p><a href="/">Back to Home</a></p>
+    <img src="/stream_feed/''' + vid + '''" style="max-width: 800px; height: auto;" />
+    '''
+    return render_template_string(page)
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=True, host='127.0.0.1', port=8000, use_reloader=False)

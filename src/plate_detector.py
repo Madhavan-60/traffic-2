@@ -89,21 +89,26 @@ def detect_plates(img, ocr=False, debug=False):
 def has_pytesseract():
     return _HAS_PYTESSERACT
 
-# Example usage:
-img = cv2.imread('car.jpg')  # Replace with your image filename
-results = detect_plates(img, ocr=False)  # Set ocr=True if you want OCR
 
-for plate in results:
-    print("Plate bbox:", plate['bbox'], "Text:", plate['text'])
-    # Draw rectangle for visualization
-    x1, y1, x2, y2 = plate['bbox']
-    cv2.rectangle(img, (x1, y1), (x2, y2), (0,255,255), 2)
-    cv2.putText(img, plate['text'], (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,255), 2)
+if __name__ == "__main__":
+    # Example usage (only runs when executing this file directly)
+    img = cv2.imread('car.jpg')  # Replace with your image filename
+    results = detect_plates(img, ocr=False)  # Set ocr=True if you want OCR
 
-cv2.imshow('Detected Plates', img)
-cv2.waitKey(0)
-cv2.destroyAllWindows()
+    for plate in results:
+        print("Plate bbox:", plate['bbox'], "Text:", plate['text'])
+        # Draw rectangle for visualization
+        x1, y1, x2, y2 = plate['bbox']
+        cv2.rectangle(img, (x1, y1), (x2, y2), (0,255,255), 2)
+        cv2.putText(img, plate['text'], (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,255), 2)
 
-import pytesseract
-pytesseract.pytesseract.tesseract_cmd = r'C:\\Program Files\\Tesseract-OCR\\tesseract.exe'  # Update path as needed
-print(pytesseract.get_tesseract_version())
+    cv2.imshow('Detected Plates', img)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+    try:
+        import pytesseract
+        pytesseract.pytesseract.tesseract_cmd = r'C:\\Program Files\\Tesseract-OCR\\tesseract.exe'  # Update path as needed
+        print(pytesseract.get_tesseract_version())
+    except Exception:
+        pass
