@@ -13,6 +13,30 @@ from tracker import CentroidTracker
 VEHICLE_CLASSES = {2: 'car', 3: 'motorcycle', 5: 'bus', 7: 'truck'}
 
 
+def draw_label(img, bbox, text, color=(0, 255, 0), font_scale=0.6, thickness=2):
+    """Draw a rectangle with a filled label above it.
+    bbox: (x1,y1,x2,y2)
+    text: label text
+    """
+    x1, y1, x2, y2 = bbox
+    # box
+    cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
+
+    # label background
+    (w, h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+    pad = 4
+    lx1 = x1
+    ly1 = max(0, y1 - h - pad * 2)
+    lx2 = x1 + w + pad * 2
+    ly2 = y1
+    cv2.rectangle(img, (lx1, ly1), (lx2, ly2), color, -1)
+
+    # label text (white on colored background)
+    text_x = x1 + pad
+    text_y = y1 - pad
+    cv2.putText(img, text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness)
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--source', type=str, default='0', help='Path to video file or webcam index')
@@ -153,9 +177,11 @@ def main():
                 if len(object_tracks[oid]) > 10:
                     object_tracks[oid] = object_tracks[oid][-10:]
 
-                # draw bbox and id
-                cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0,255,0), 2)
-                cv2.putText(frame, f"ID {oid} {cls_name}", (bbox[0], bbox[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0),2)
+                # draw bbox and label with confidence and id
+                conf_pct = int(info.get('score', 0) * 100)
+                label = f"{cls_name}: {conf_pct}%"
+                draw_label(frame, bbox, label, color=(0,255,0), font_scale=0.5, thickness=1)
+                cv2.putText(frame, f"ID {oid}", (bbox[0], bbox[3]+15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0),1)
                 cv2.circle(frame, (cx, cy), 3, (0,0,255), -1)
 
                 # check crossing event
