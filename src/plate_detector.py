@@ -103,3 +103,7 @@ for plate in results:
 cv2.imshow('Detected Plates', img)
 cv2.waitKey(0)
 cv2.destroyAllWindows()
+
+import pytesseract
+pytesseract.pytesseract.tesseract_cmd = r'C:\\Program Files\\Tesseract-OCR\\tesseract.exe'  # Update path as needed
+print(pytesseract.get_tesseract_version())
