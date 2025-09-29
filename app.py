@@ -23,6 +23,8 @@ YOLO_MODEL = YOLO(os.path.join(CURRENT_DIR, 'yolov8n.pt')) if os.path.exists(os.
 
 # Track uploaded video sources by id for streaming
 VIDEO_SOURCES = {}
+VIDEO_TARGET = {}
+VIDEO_SNAPSHOT = {}
 
 HTML = '''
 <!doctype html>
@@ -262,7 +264,7 @@ def live_page():
     return render_template_string(live_html)
 
 
-def gen_video_stream(video_path: str):
+def gen_video_stream(video_path: str, vid: str | None = None, target_id: int | None = None):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f'Cannot open video: {video_path}')
@@ -318,6 +320,7 @@ def gen_video_stream(video_path: str):
                         'score': scores[idx] if idx < len(scores) else 0.0
                     }
 
+                stop_stream = False
                 for oid, info in centroid_to_info.items():
                     c = info['centroid']
                     bbox = info['bbox']
@@ -346,6 +349,23 @@ def gen_video_stream(video_path: str):
                             counts['out'] += 1
                             counted_ids.add(oid)
 
+                    # If a target id is set and appears, snapshot and stop
+                    if target_id is not None and oid == target_id and not stop_stream:
+                        # save snapshot of current frame crop
+                        try:
+                            x1c, y1c, x2c, y2c = bbox
+                            crop = frame[max(0,y1c):max(0,y2c), max(0,x1c):max(0,x2c)]
+                            snap_dir = os.path.join(CURRENT_DIR, 'snapshots')
+                            os.makedirs(snap_dir, exist_ok=True)
+                            snap_path = os.path.join(snap_dir, f'{vid}_id{oid}.jpg')
+                            if crop.size > 0:
+                                cv2.imwrite(snap_path, crop)
+                                if vid is not None:
+                                    VIDEO_SNAPSHOT[vid] = snap_path
+                        except Exception:
+                            pass
+                        stop_stream = True
+
                 cv2.putText(frame, f"IN: {counts['in']}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
                 cv2.putText(frame, f"OUT: {counts['out']}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
             except Exception:
@@ -357,6 +377,8 @@ def gen_video_stream(video_path: str):
             frame_bytes = buffer.tobytes()
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+            if 'stop_stream' in locals() and stop_stream:
+                break
     finally:
         cap.release()
 
@@ -366,21 +388,45 @@ def stream_feed(vid):
     video_path = VIDEO_SOURCES.get(vid)
     if not video_path or not os.path.exists(video_path):
         return 'Video not found', 404
-    return Response(gen_video_stream(video_path), mimetype='multipart/x-mixed-replace; boundary=frame')
+    target_param = request.args.get('target')
+    try:
+        target_id = int(target_param) if target_param is not None and target_param != '' else None
+    except Exception:
+        target_id = None
+    VIDEO_TARGET[vid] = target_id
+    return Response(gen_video_stream(video_path, vid, target_id), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 
-@app.route('/watch/<vid>')
+@app.route('/watch/<vid>', methods=['GET','POST'])
 def watch_video(vid):
     if vid not in VIDEO_SOURCES:
         return 'Video not found', 404
+    if request.method == 'POST':
+        target = request.form.get('track_id', '').strip()
+        return redirect(url_for('watch_video', vid=vid, target=target))
+    target_q = request.args.get('target', '')
     page = '''
     <!doctype html>
     <title>Video Detection</title>
     <h2>Streaming processed video</h2>
     <p><a href="/">Back to Home</a></p>
-    <img src="/stream_feed/''' + vid + '''" style="max-width: 800px; height: auto;" />
+    <form method="post" style="margin-bottom: 10px;">
+      <label>Stop on ID: <input type="number" name="track_id" value="''' + (target_q or '') + '''" /></label>
+      <button type="submit">Set</button>
+    </form>
+    <img src="/stream_feed/''' + vid + (('?target=' + target_q) if target_q else '') + '''" style="max-width: 800px; height: auto; border:1px solid #ccc;" />
+    <p>Snapshot (after stop): <a href="/snapshot/''' + vid + '''" target="_blank">open</a></p>
     '''
     return render_template_string(page)
+
+
+@app.route('/snapshot/<vid>')
+def snapshot(vid):
+    from flask import send_file
+    path = VIDEO_SNAPSHOT.get(vid)
+    if not path or not os.path.exists(path):
+        return 'Snapshot not available yet', 404
+    return send_file(path, mimetype='image/jpeg', as_attachment=False)
 
 if __name__ == '__main__':
     app.run(debug=True, host='127.0.0.1', port=8000, use_reloader=False)
