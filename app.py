@@ -4,6 +4,7 @@ import numpy as np
 import os
 import sys
 import uuid
+import platform
 
 # Ensure we can import modules from the local src directory when running app.py directly
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -25,6 +26,7 @@ YOLO_MODEL = YOLO(os.path.join(CURRENT_DIR, 'yolov8n.pt')) if os.path.exists(os.
 VIDEO_SOURCES = {}
 VIDEO_TARGET = {}
 VIDEO_SNAPSHOT = {}
+VIDEO_CONFIG = {}
 
 HTML = '''
 <!doctype html>
@@ -33,6 +35,7 @@ HTML = '''
 <form method=post enctype=multipart/form-data>
   <input type=file name=file accept="image/*,video/*">
   <label><input type=checkbox name=video value=1> Treat as video</label>
+  <label style="margin-left: 10px;"><input type=checkbox name=ocr value=1> Enable OCR (ANPR)</label>
   <input type=submit value=Upload>
 </form>
 <p><a href="/live">Go to Live Detection</a></p>
@@ -71,6 +74,7 @@ def upload_file():
         if file and file.filename:
             filename = file.filename.lower()
             is_video = ('video' in request.form) or any(filename.endswith(ext) for ext in ['.mp4', '.mov', '.avi', '.mkv'])
+            want_ocr = ('ocr' in request.form)
 
             if is_video:
                 tmp_in = os.path.join(CURRENT_DIR, 'upload_video_tmp')
@@ -80,6 +84,7 @@ def upload_file():
 
                 vid = uuid.uuid4().hex
                 VIDEO_SOURCES[vid] = in_path
+                VIDEO_CONFIG[vid] = {'ocr': want_ocr}
                 return redirect(url_for('watch_video', vid=vid))
             else:
                 # Read uploaded bytes and decode as image
@@ -106,7 +111,7 @@ def upload_file():
                         pass
 
                     # 2) Optional: license plate candidates (non-OCR) over whole image
-                    plate_results = detect_plates(img, ocr=False)
+                    plate_results = detect_plates(img, ocr=want_ocr)
                     if plate_results:
                         if results is None:
                             results = []
@@ -366,8 +371,34 @@ def gen_video_stream(video_path: str, vid: str | None = None, target_id: int | N
                             pass
                         stop_stream = True
 
+                # overlay totals
                 cv2.putText(frame, f"IN: {counts['in']}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
                 cv2.putText(frame, f"OUT: {counts['out']}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+
+                # ANPR overlay if enabled for this video
+                cfg = VIDEO_CONFIG.get(vid, {}) if vid else {}
+                want_ocr = bool(cfg.get('ocr', False))
+                if want_ocr and rects:
+                    # For each tracked object, run plate detection in its ROI and overlay text
+                    for oid, info in centroid_to_info.items():
+                        x1b, y1b, x2b, y2b = info['bbox']
+                        pad_w = int((x2b - x1b) * 0.05)
+                        pad_h = int((y2b - y1b) * 0.1)
+                        rx1 = max(0, x1b - pad_w)
+                        ry1 = max(0, y1b - pad_h)
+                        rx2 = min(frame.shape[1] - 1, x2b + pad_w)
+                        ry2 = min(frame.shape[0] - 1, y2b + pad_h)
+                        roi = frame[ry1:ry2, rx1:rx2]
+                        plate_results = detect_plates(roi, ocr=True)
+                        for pr in plate_results:
+                            pbx1, pby1, pbx2, pby2 = pr['bbox']
+                            pbx1_f = rx1 + pbx1
+                            pby1_f = ry1 + pby1
+                            pbx2_f = rx1 + pbx2
+                            pby2_f = ry1 + pby2
+                            cv2.rectangle(frame, (pbx1_f, pby1_f), (pbx2_f, pby2_f), (0, 255, 255), 2)
+                            if pr.get('text'):
+                                cv2.putText(frame, pr['text'], (pbx1_f, max(0, pby1_f - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
             except Exception:
                 pass
 
@@ -403,8 +434,14 @@ def watch_video(vid):
         return 'Video not found', 404
     if request.method == 'POST':
         target = request.form.get('track_id', '').strip()
+        # toggle OCR setting per video
+        cfg = VIDEO_CONFIG.get(vid, {})
+        cfg['ocr'] = ('ocr' in request.form)
+        VIDEO_CONFIG[vid] = cfg
         return redirect(url_for('watch_video', vid=vid, target=target))
     target_q = request.args.get('target', '')
+    cfg = VIDEO_CONFIG.get(vid, {})
+    ocr_checked_attr = 'checked' if cfg.get('ocr') else ''
     page = '''
     <!doctype html>
     <title>Video Detection</title>
@@ -412,6 +449,7 @@ def watch_video(vid):
     <p><a href="/">Back to Home</a></p>
     <form method="post" style="margin-bottom: 10px;">
       <label>Stop on ID: <input type="number" name="track_id" value="''' + (target_q or '') + '''" /></label>
+      <label style="margin-left: 10px;"><input type="checkbox" name="ocr" ''' + ocr_checked_attr + ''' /> ANPR</label>
       <button type="submit">Set</button>
     </form>
     <img src="/stream_feed/''' + vid + (('?target=' + target_q) if target_q else '') + '''" style="max-width: 800px; height: auto; border:1px solid #ccc;" />
