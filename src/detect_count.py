@@ -182,8 +182,11 @@ def main():
             # write frame
             writer.write(frame)
 
-            # optional: show
-            cv2.imshow('frame', frame)
+            # optional: show in fullscreen
+            cv2.namedWindow("frame", cv2.WND_PROP_FULLSCREEN)
+            cv2.setWindowProperty("frame", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+            cv2.imshow("frame", frame)
+
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
