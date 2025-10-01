@@ -16,6 +16,7 @@ from plate_detector import detect_plates
 from detect_count import process_video, draw_label, VEHICLE_CLASSES
 from tracker import CentroidTracker
 from ultralytics import YOLO
+from accident import AccidentDetector
 
 app = Flask(__name__)
 
@@ -27,6 +28,7 @@ VIDEO_SOURCES = {}
 VIDEO_TARGET = {}
 VIDEO_SNAPSHOT = {}
 VIDEO_CONFIG = {}
+ACCIDENT_SNAPSHOT = {}
 
 HTML = '''
 <!doctype html>
@@ -154,6 +156,7 @@ def gen_live(camera_index: int = 0):
     if not cap.isOpened():
         raise RuntimeError('Cannot open webcam')
     tracker = CentroidTracker(max_disappeared=40, max_distance=60)
+    accident_detector = AccidentDetector()
     counts = {'in': 0, 'out': 0}
     object_tracks = {}
     counted_ids = set()
@@ -206,6 +209,10 @@ def gen_live(camera_index: int = 0):
                         'score': scores[idx] if idx < len(scores) else 0.0
                     }
 
+                # build inputs for accident detector
+                oid_to_dy = {}
+                oid_to_bbox = {}
+                oid_to_centroid_y = {}
                 for oid, info in centroid_to_info.items():
                     c = info['centroid']
                     bbox = info['bbox']
@@ -218,6 +225,13 @@ def gen_live(camera_index: int = 0):
                     object_tracks[oid].append(cy)
                     if len(object_tracks[oid]) > 10:
                         object_tracks[oid] = object_tracks[oid][-10:]
+                    # dy magnitude as simple speed proxy
+                    if len(object_tracks[oid]) >= 2:
+                        oid_to_dy[oid] = abs(object_tracks[oid][-1] - object_tracks[oid][-2])
+                    else:
+                        oid_to_dy[oid] = 0
+                    oid_to_bbox[oid] = bbox
+                    oid_to_centroid_y[oid] = cy
 
                     conf_pct = int(info.get('score', 0) * 100)
                     label = f"{cls_name}: {conf_pct}%"
@@ -239,6 +253,11 @@ def gen_live(camera_index: int = 0):
                 # overlay totals
                 cv2.putText(frame, f"IN: {counts['in']}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
                 cv2.putText(frame, f"OUT: {counts['out']}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+
+                # accident detection via module
+                accident = accident_detector.update(oid_to_bbox, oid_to_centroid_y)
+                if accident:
+                    cv2.putText(frame, 'ACCIDENT DETECTED', (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 3)
             except Exception:
                 pass
 
@@ -274,6 +293,7 @@ def gen_video_stream(video_path: str, vid: str | None = None, target_id: int | N
     if not cap.isOpened():
         raise RuntimeError(f'Cannot open video: {video_path}')
     tracker = CentroidTracker(max_disappeared=40, max_distance=60)
+    accident_detector = AccidentDetector()
     counts = {'in': 0, 'out': 0}
     object_tracks = {}
     counted_ids = set()
@@ -326,6 +346,8 @@ def gen_video_stream(video_path: str, vid: str | None = None, target_id: int | N
                     }
 
                 stop_stream = False
+                oid_to_bbox = {}
+                oid_to_centroid_y = {}
                 for oid, info in centroid_to_info.items():
                     c = info['centroid']
                     bbox = info['bbox']
@@ -343,6 +365,8 @@ def gen_video_stream(video_path: str, vid: str | None = None, target_id: int | N
                     draw_label(frame, bbox, label, color=(0, 255, 0), font_scale=0.5, thickness=1)
                     cv2.putText(frame, f"ID {oid}", (bbox[0], bbox[3] + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
                     cv2.circle(frame, (cx, cy), 3, (0, 0, 255), -1)
+                    oid_to_bbox[oid] = bbox
+                    oid_to_centroid_y[oid] = cy
 
                     if oid not in counted_ids and len(object_tracks[oid]) >= 2:
                         prev_y = object_tracks[oid][-2]
@@ -399,6 +423,10 @@ def gen_video_stream(video_path: str, vid: str | None = None, target_id: int | N
                             cv2.rectangle(frame, (pbx1_f, pby1_f), (pbx2_f, pby2_f), (0, 255, 255), 2)
                             if pr.get('text'):
                                 cv2.putText(frame, pr['text'], (pbx1_f, max(0, pby1_f - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                # accident detection via module
+                accident = accident_detector.update(oid_to_bbox, oid_to_centroid_y)
+                if accident:
+                    cv2.putText(frame, 'ACCIDENT DETECTED', (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 3)
             except Exception:
                 pass
 
