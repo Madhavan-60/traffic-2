@@ -51,11 +51,11 @@ HTML = '''
 {% endif %}
 {% if image_url %}
   <h3>Processed Image:</h3>
-  <img src="{{ image_url }}" style="max-width: 640px; height: auto;" />
+  <img src="{{ image_url }}" style="width: 100%; max-width: 1200px; height: auto; border:2px solid #333;" />
 {% endif %}
 {% if video_url %}
   <h3>Processed Video:</h3>
-  <video width="640" controls>
+  <video width="100%" style="max-width: 1200px; height: auto; border:2px solid #333;" controls>
     <source src="{{ video_url }}" type="video/mp4">
   </video>
   {% if counts %}
@@ -155,13 +155,18 @@ def gen_live(camera_index: int = 0):
     cap = cv2.VideoCapture(camera_index)
     if not cap.isOpened():
         raise RuntimeError('Cannot open webcam')
-    tracker = CentroidTracker(max_disappeared=40, max_distance=60)
-    accident_detector = AccidentDetector()
+    # Set camera resolution for faster processing
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    tracker = CentroidTracker(max_disappeared=60, max_distance=100)
+    accident_detector = AccidentDetector(iou_threshold=0.15, dy_threshold=3.0, consecutive_frames=2)
     counts = {'in': 0, 'out': 0}
     object_tracks = {}
     counted_ids = set()
     line_initialized = False
     x1 = y1 = x2 = y2 = 0
+    frame_skip = 0
     try:
         while True:
             ret, frame = cap.read()
@@ -173,7 +178,9 @@ def gen_live(camera_index: int = 0):
                     x1, y1, x2, y2 = 0, int(h * 0.6), w, int(h * 0.6)
                     line_initialized = True
 
-                yolo_results = YOLO_MODEL.predict(frame, conf=0.3, iou=0.5, verbose=False)
+                # Resize frame for faster processing
+                small_frame = cv2.resize(frame, (640, 480))
+                yolo_results = YOLO_MODEL.predict(small_frame, conf=0.2, iou=0.4, verbose=False, half=True, device='cpu')
                 r = yolo_results[0]
                 boxes = r.boxes
                 rects = []
@@ -235,8 +242,8 @@ def gen_live(camera_index: int = 0):
 
                     conf_pct = int(info.get('score', 0) * 100)
                     label = f"{cls_name}: {conf_pct}%"
-                    draw_label(frame, bbox, label, color=(0, 255, 0), font_scale=0.5, thickness=1)
-                    cv2.putText(frame, f"ID {oid}", (bbox[0], bbox[3] + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                    draw_label(frame, bbox, label, color=(0, 255, 0), font_scale=0.7, thickness=2)
+                    cv2.putText(frame, f"ID {oid}", (bbox[0], bbox[3] + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
                     cv2.circle(frame, (cx, cy), 3, (0, 0, 255), -1)
 
                     # crossing check
@@ -251,17 +258,18 @@ def gen_live(camera_index: int = 0):
                             counted_ids.add(oid)
 
                 # overlay totals
-                cv2.putText(frame, f"IN: {counts['in']}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-                cv2.putText(frame, f"OUT: {counts['out']}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+                cv2.putText(frame, f"IN: {counts['in']}", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+                cv2.putText(frame, f"OUT: {counts['out']}", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
 
                 # accident detection via module
                 accident = accident_detector.update(oid_to_bbox, oid_to_centroid_y)
                 if accident:
-                    cv2.putText(frame, 'ACCIDENT DETECTED', (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 3)
+                    cv2.putText(frame, 'ACCIDENT DETECTED', (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,0,255), 4)
             except Exception:
                 pass
 
-            ret, buffer = cv2.imencode('.jpg', frame)
+            # Higher quality encoding for clearer video
+            ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
             if not ret:
                 continue
             frame_bytes = buffer.tobytes()
@@ -283,22 +291,56 @@ def live_page():
     <title>Live Detection</title>
     <h2>Live Webcam Detection</h2>
     <p><a href="/">Back to Home</a></p>
-    <img src="/live_feed" style="max-width: 800px; height: auto;" />
+    <img id="liveStream" src="/live_feed" style="width: 100%; max-width: 1600px; height: auto; border:2px solid #333;" />
+    <br><br>
+    <button onclick="toggleFullscreen()" style="padding: 10px 20px; font-size: 16px; background: #007bff; color: white; border: none; border-radius: 5px; cursor: pointer;">Toggle Fullscreen</button>
+    <script>
+    function toggleFullscreen() {
+        const img = document.getElementById('liveStream');
+        if (img.requestFullscreen) {
+            img.requestFullscreen();
+        } else if (img.webkitRequestFullscreen) {
+            img.webkitRequestFullscreen();
+        } else if (img.msRequestFullscreen) {
+            img.msRequestFullscreen();
+        }
+    }
+    </script>
     '''
     return render_template_string(live_html)
 
 
 def gen_video_stream(video_path: str, vid: str | None = None, target_id: int | None = None):
-    cap = cv2.VideoCapture(video_path)
+    # Try different backends for better compatibility
+    cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
     if not cap.isOpened():
-        raise RuntimeError(f'Cannot open video: {video_path}')
-    tracker = CentroidTracker(max_disappeared=40, max_distance=60)
-    accident_detector = AccidentDetector()
+        cap = cv2.VideoCapture(video_path, cv2.CAP_ANY)
+    if not cap.isOpened():
+        cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"ERROR: Cannot open video {video_path}")
+        print("Try converting to H.264 MP4 format")
+        # Return a simple error image
+        error_img = np.zeros((480, 640, 3), dtype=np.uint8)
+        cv2.putText(error_img, "Video format not supported", (50, 240), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+        cv2.putText(error_img, "Try H.264 MP4", (50, 280), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        ret, buffer = cv2.imencode('.jpg', error_img)
+        if ret:
+            frame_bytes = buffer.tobytes()
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+        return
+    # Set video properties for faster processing
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    tracker = CentroidTracker(max_disappeared=60, max_distance=100)
+    accident_detector = AccidentDetector(iou_threshold=0.15, dy_threshold=3.0, consecutive_frames=2)
     counts = {'in': 0, 'out': 0}
     object_tracks = {}
     counted_ids = set()
     line_initialized = False
     x1 = y1 = x2 = y2 = 0
+    frame_skip = 0
     try:
         while True:
             ret, frame = cap.read()
@@ -310,7 +352,9 @@ def gen_video_stream(video_path: str, vid: str | None = None, target_id: int | N
                     x1, y1, x2, y2 = 0, int(h * 0.6), w, int(h * 0.6)
                     line_initialized = True
 
-                yolo_results = YOLO_MODEL.predict(frame, conf=0.3, iou=0.5, verbose=False)
+                # Resize frame for faster processing
+                small_frame = cv2.resize(frame, (640, 480))
+                yolo_results = YOLO_MODEL.predict(small_frame, conf=0.2, iou=0.4, verbose=False, half=True, device='cpu')
                 r = yolo_results[0]
                 boxes = r.boxes
                 rects = []
@@ -362,8 +406,8 @@ def gen_video_stream(video_path: str, vid: str | None = None, target_id: int | N
 
                     conf_pct = int(info.get('score', 0) * 100)
                     label = f"{cls_name}: {conf_pct}%"
-                    draw_label(frame, bbox, label, color=(0, 255, 0), font_scale=0.5, thickness=1)
-                    cv2.putText(frame, f"ID {oid}", (bbox[0], bbox[3] + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                    draw_label(frame, bbox, label, color=(0, 255, 0), font_scale=0.7, thickness=2)
+                    cv2.putText(frame, f"ID {oid}", (bbox[0], bbox[3] + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
                     cv2.circle(frame, (cx, cy), 3, (0, 0, 255), -1)
                     oid_to_bbox[oid] = bbox
                     oid_to_centroid_y[oid] = cy
@@ -396,8 +440,8 @@ def gen_video_stream(video_path: str, vid: str | None = None, target_id: int | N
                         stop_stream = True
 
                 # overlay totals
-                cv2.putText(frame, f"IN: {counts['in']}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-                cv2.putText(frame, f"OUT: {counts['out']}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+                cv2.putText(frame, f"IN: {counts['in']}", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+                cv2.putText(frame, f"OUT: {counts['out']}", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
 
                 # ANPR overlay if enabled for this video
                 cfg = VIDEO_CONFIG.get(vid, {}) if vid else {}
@@ -426,11 +470,12 @@ def gen_video_stream(video_path: str, vid: str | None = None, target_id: int | N
                 # accident detection via module
                 accident = accident_detector.update(oid_to_bbox, oid_to_centroid_y)
                 if accident:
-                    cv2.putText(frame, 'ACCIDENT DETECTED', (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 3)
+                    cv2.putText(frame, 'ACCIDENT DETECTED', (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,0,255), 4)
             except Exception:
                 pass
 
-            ret, buffer = cv2.imencode('.jpg', frame)
+            # Higher quality encoding for clearer video
+            ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
             if not ret:
                 continue
             frame_bytes = buffer.tobytes()
@@ -480,7 +525,21 @@ def watch_video(vid):
       <label style="margin-left: 10px;"><input type="checkbox" name="ocr" ''' + ocr_checked_attr + ''' /> ANPR</label>
       <button type="submit">Set</button>
     </form>
-    <img src="/stream_feed/''' + vid + (('?target=' + target_q) if target_q else '') + '''" style="max-width: 800px; height: auto; border:1px solid #ccc;" />
+    <img id="videoStream" src="/stream_feed/''' + vid + (('?target=' + target_q) if target_q else '') + '''" style="width: 100%; max-width: 1600px; height: auto; border:2px solid #333;" />
+    <br><br>
+    <button onclick="toggleFullscreen()" style="padding: 10px 20px; font-size: 16px; background: #007bff; color: white; border: none; border-radius: 5px; cursor: pointer;">Toggle Fullscreen</button>
+    <script>
+    function toggleFullscreen() {
+        const img = document.getElementById('videoStream');
+        if (img.requestFullscreen) {
+            img.requestFullscreen();
+        } else if (img.webkitRequestFullscreen) {
+            img.webkitRequestFullscreen();
+        } else if (img.msRequestFullscreen) {
+            img.msRequestFullscreen();
+        }
+    }
+    </script>
     <p>Snapshot (after stop): <a href="/snapshot/''' + vid + '''" target="_blank">open</a></p>
     '''
     return render_template_string(page)
@@ -493,6 +552,30 @@ def snapshot(vid):
     if not path or not os.path.exists(path):
         return 'Snapshot not available yet', 404
     return send_file(path, mimetype='image/jpeg', as_attachment=False)
+
+
+@app.route('/test_video/<vid>')
+def test_video(vid):
+    """Test if video can be opened"""
+    video_path = VIDEO_SOURCES.get(vid)
+    if not video_path or not os.path.exists(video_path):
+        return 'Video not found', 404
+    
+    cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
+    if not cap.isOpened():
+        cap = cv2.VideoCapture(video_path, cv2.CAP_ANY)
+    if not cap.isOpened():
+        cap = cv2.VideoCapture(video_path)
+    
+    if cap.isOpened():
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        return f"Video OK: {width}x{height}, {fps:.1f}fps, {frame_count} frames"
+    else:
+        return f"ERROR: Cannot open video {video_path}. Try converting to H.264 MP4 format."
 
 if __name__ == '__main__':
     app.run(debug=True, host='127.0.0.1', port=8000, use_reloader=False)
